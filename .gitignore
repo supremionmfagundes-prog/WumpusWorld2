@@ -1,0 +1,19 @@
+# Ambientes virtuais
+.venv/
+.venv311/
+venv/
+env/
+
+# Build e distribuição PyInstaller
+build/
+dist/
+*.spec
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VS Code
+.vscode/
