@@ -198,6 +198,7 @@ class Jogo:
         self.score     = 0
         self.ouro      = 0
         self.collected_gold_positions = set()
+        self.killed_wumpus_positions = set()
         self.flecha    = True   # O agente começa com uma única flecha.
         self.visitados = set()  # Células já visitadas (reveladas no mapa).
         self.perc_map  = {}     # Percepções salvas por célula visitada.
@@ -312,6 +313,7 @@ class Jogo:
             for i, (wr, wc) in enumerate(self.wumpuses):
                 if (wr, wc) == (r, c) and self.wumpus_vivo[i]:
                     self.wumpus_vivo[i] = False
+                    self.killed_wumpus_positions.add((wr, wc))
                     self._grito = True
                     acertou = True
                     self._msg("GRITO! Wumpus abatido!", COL_OK)
@@ -400,6 +402,7 @@ class JogoAjudante:
         self.score = 0
         self.ouro = 0
         self.collected_gold_positions = set()
+        self.killed_wumpus_positions = set()
         self.visitados = set()
         self.perc_map = {}
         self.known_pits = set()
@@ -557,6 +560,7 @@ class JogoAjudante:
             for i, (wr, wc) in enumerate(self.wumpuses):
                 if (wr, wc) == (r, c) and self.wumpus_vivo[i]:
                     self.wumpus_vivo[i] = False
+                    self.killed_wumpus_positions.add((wr, wc))
                     self._forget_wumpus((wr, wc))
                     agent["grito"] = True
                     for dr2, dc2 in DIRS:
@@ -876,10 +880,13 @@ class AutoPlayer:
         self.tie_bias = tie_bias
         self.queue = deque()
         self.stuck_count = 0
+        self.bat_attempts = 0
+        self.max_bat_attempts = 2
 
     def reset(self):
         self.queue.clear()
         self.stuck_count = 0
+        self.bat_attempts = 0
 
     def _neighbors(self, r, c):
         for dr, dc in DIRS:
@@ -1031,6 +1038,7 @@ class AutoPlayer:
 
     def _risk_map(self):
         risk = {(r, c): 0 for r in range(TAM) for c in range(TAM)}
+        bat_hint = {(r, c): 0 for r in range(TAM) for c in range(TAM)}
         safe = set(self.jogo.visitados)
 
         for rc in self.jogo.visitados:
@@ -1049,12 +1057,14 @@ class AutoPlayer:
                 if "Fedor" in percs:
                     risk[nb] += 4
                 if "Gritos" in percs:
+                    # Morcego tem risco real, mas menor que perigos letais (poço/Wumpus).
                     risk[nb] += 2
+                    bat_hint[nb] += 1
 
         for rc in safe:
             risk[rc] -= 5
 
-        return risk, safe
+        return risk, safe, bat_hint
 
     def _enqueue_plan(self):
         if not self.jogo.vivo or self.jogo.saiu:
@@ -1095,7 +1105,7 @@ class AutoPlayer:
             self.stuck_count = 0
             return
 
-        risk, _safe = self._risk_map()
+        risk, _safe, bat_hint = self._risk_map()
 
         frontier = set()
         for vr, vc in visited:
@@ -1115,7 +1125,22 @@ class AutoPlayer:
                 self.stuck_count = 0
             return
 
-        candidates = sorted(frontier, key=lambda p: (risk[p], abs(p[0] - r) + abs(p[1] - c)))
+        ranked = sorted(frontier, key=lambda p: (risk[p], bat_hint[p], abs(p[0] - r) + abs(p[1] - c)))
+
+        # Prioriza células sem risco de morcego. Só tenta morcego de 1 a 2 vezes no máximo.
+        non_bat_candidates = [p for p in ranked if bat_hint[p] == 0]
+        bat_candidates = [p for p in ranked if bat_hint[p] > 0]
+        if non_bat_candidates:
+            candidates = non_bat_candidates
+        elif self.bat_attempts < self.max_bat_attempts:
+            candidates = bat_candidates
+        else:
+            candidates = []
+
+        # Mantém um teto de risco para não assumir perigos altos cedo demais.
+        safer_candidates = [p for p in candidates if risk[p] <= 8]
+        if safer_candidates:
+            candidates = safer_candidates
 
         # Tenta encontrar caminho para algum candidato (não só o melhor), evitando travar em um alvo impossível.
         for cand in candidates:
@@ -1124,6 +1149,8 @@ class AutoPlayer:
             allowed.add(cand)
             path = self._path((r, c), cand, allowed)
             if path and len(path) > 1:
+                if bat_hint[cand] > 0:
+                    self.bat_attempts += 1
                 self._enqueue_path(path)
                 self.stuck_count = 0
                 return
@@ -1131,8 +1158,20 @@ class AutoPlayer:
         # Se não há caminho, tenta avançar para um vizinho desconhecido de menor risco.
         unknown_adj = [nb for nb in self._neighbors(r, c) if nb not in visited]
         if unknown_adj:
-            target = min(unknown_adj, key=lambda p: risk[p])
-            if risk[target] <= 8 or self.stuck_count >= 2:
+            unknown_non_bat = [p for p in unknown_adj if bat_hint[p] == 0]
+            unknown_bat = [p for p in unknown_adj if bat_hint[p] > 0]
+
+            if unknown_non_bat:
+                target = min(unknown_non_bat, key=lambda p: risk[p])
+            elif unknown_bat and self.bat_attempts < self.max_bat_attempts:
+                target = min(unknown_bat, key=lambda p: risk[p])
+            else:
+                target = None
+
+            # Só aceita risco alto em último caso para destravar.
+            if target is not None and (risk[target] <= 7 or (self.stuck_count >= 3 and risk[target] <= 12)):
+                if bat_hint[target] > 0:
+                    self.bat_attempts += 1
                 dr, dc = target[0] - r, target[1] - c
                 wanted = DIRS.index((dr, dc))
                 for t in self._turn_steps(self.jogo.dir, wanted):
@@ -1244,10 +1283,10 @@ def _draw_item(surf, key, img, cor, px, py, w, h):
 
 
 def _draw_collected_gold_marker(surf, rx, ry):
-    marker_w = TILE - 42
-    marker_h = TILE - 42
-    px = rx + (TILE - marker_w) // 2
-    py = ry + (TILE - marker_h) // 2
+    marker_w = TILE - 18
+    marker_h = TILE - 18
+    px = rx + 9
+    py = ry + 9
 
     if img_gold:
         gold_icon = pygame.transform.smoothscale(img_gold, (marker_w, marker_h))
@@ -1257,6 +1296,29 @@ def _draw_collected_gold_marker(surf, rx, ry):
         pygame.draw.ellipse(surf, (210, 160, 0), (px, py, marker_w, marker_h), 2)
 
     # Check verde centralizado, no mesmo bloco visual do ouro coletado.
+    cx = rx + TILE // 2
+    cy = ry + TILE // 2
+    c1 = (cx - 16, cy + 2)
+    c2 = (cx - 6,  cy + 12)
+    c3 = (cx + 14, cy - 12)
+    pygame.draw.line(surf, COL_OK, c1, c2, 5)
+    pygame.draw.line(surf, COL_OK, c2, c3, 5)
+
+
+def _draw_killed_wumpus_marker(surf, rx, ry):
+    marker_w = TILE - 18
+    marker_h = TILE - 18
+    px = rx + 9
+    py = ry + 9
+
+    if img_wumpus:
+        wumpus_icon = pygame.transform.smoothscale(img_wumpus, (marker_w, marker_h))
+        surf.blit(wumpus_icon, (px, py))
+    else:
+        pygame.draw.ellipse(surf, COL_WUMPUS, (px, py, marker_w, marker_h))
+        pygame.draw.ellipse(surf, (120, 20, 20), (px, py, marker_w, marker_h), 2)
+
+    # Mesmo sinal de acerto usado para ouro coletado.
     cx = rx + TILE // 2
     cy = ry + TILE // 2
     c1 = (cx - 16, cy + 2)
@@ -1353,6 +1415,9 @@ def draw_cell(surf, jogo, r, c):
 
     if reveal_all and (r, c) in getattr(jogo, "collected_gold_positions", set()):
         _draw_collected_gold_marker(surf, rx, ry)
+
+    if reveal_all and (r, c) in getattr(jogo, "killed_wumpus_positions", set()):
+        _draw_killed_wumpus_marker(surf, rx, ry)
 
     if getattr(jogo, "is_helper_mode", False):
         here = []
