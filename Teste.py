@@ -33,6 +33,7 @@ NUM_WUMPUS = 2
 NUM_PITS   = 4
 NUM_GOLD   = 3
 NUM_BATS   = 2
+NUM_ARROWS = 1
 HELPER_GOLD = NUM_GOLD + 1
 HELPER_WUMPUS = NUM_WUMPUS + 1
 
@@ -51,6 +52,7 @@ COL_PIT     = (55,  55,  65)
 COL_WUMPUS  = (195, 40,  40)
 COL_GOLD    = (255, 215,  0)
 COL_BAT     = (120, 60,  180)
+COL_ARROW   = (40,  40,  40)
 COL_AGENT   = (30,  100, 220)
 COL_PANEL   = (22,  22,  32)
 COL_TEXT    = (225, 225, 225)
@@ -110,12 +112,13 @@ font_title = pygame.font.SysFont("Arial", 21, bold=True)
 img_pit    = load_img("pit.png",    SZ)
 img_wumpus = load_img("wumpus.png", SZ)
 img_gold   = load_img("gold.png",   SZ)
+img_arrow  = load_img(["flecha.png", "arrow.png", "seta.png"], SZ)
 img_agent  = load_img("agent.png",  SZA)
 img_bat    = load_img(["morcego.png", "bat.png", "morcego2.png"], SZ)
 
 
 # Gera o mapa aleatório: posiciona poços, wumpus, ouro e morcegos com regras de exclusão.
-def criar_mundo(starts=None, num_wumpus=NUM_WUMPUS, num_gold=NUM_GOLD):
+def criar_mundo(starts=None, num_wumpus=NUM_WUMPUS, num_gold=NUM_GOLD, spawn_arrow=True):
     starts = list(starts or [(START_R, START_C)])
 
     # Cada célula é um conjunto de tokens: "P"=poço, "O"=ouro, "B"=morcego.
@@ -138,27 +141,49 @@ def criar_mundo(starts=None, num_wumpus=NUM_WUMPUS, num_gold=NUM_GOLD):
              if (r, c) not in starts]
     random.shuffle(todas)
 
+    # Flecha de pickup: sorteada primeiro e em célula única dentro do 2x2 da saída.
+    # O 2x2 é: célula de início e os 3 vizinhos que formam o quadrado (linha-1 e col+1).
+    arrow_pos = None
+    sr, sc = starts[0]
+    arrow_2x2 = [
+        (r, c)
+        for r in (sr, sr - 1)
+        for c in (sc, sc + 1)
+        if 0 <= r < TAM and 0 <= c < TAM
+    ]
+    arrow_pool = arrow_2x2[:]
+    random.shuffle(arrow_pool)
+    if spawn_arrow and arrow_pool and NUM_ARROWS > 0:
+        arrow_pos = arrow_pool[0]
+        celulas[arrow_pos[0]][arrow_pos[1]].add("A")
+
     # Coloca os poços em posições aleatórias.
     pits = set()
     for pos in todas:
         if len(pits) >= NUM_PITS:
             break
-        if pos in safe_start_zone:
+        if pos in safe_start_zone or pos == arrow_pos:
             continue
         pits.add(pos)
     for r, c in pits:
         celulas[r][c].add("P")
 
     # Wumpus fica longe da saída (e nunca em cima de poço ou zona segura inicial).
-    cand_w = [p for p in todas if p not in pits and p not in safe_start_zone and not perto_start(*p)]
+    cand_w = [
+        p for p in todas
+        if p not in pits and p not in safe_start_zone and p != arrow_pos and not perto_start(*p)
+    ]
     if len(cand_w) < num_wumpus:
-        cand_w = [p for p in todas if p not in pits and p not in safe_start_zone]
+        cand_w = [p for p in todas if p not in pits and p not in safe_start_zone and p != arrow_pos]
     random.shuffle(cand_w)
     wumpus_list = cand_w[:num_wumpus]
 
-    # Ouro não pode compartilhar célula com poço, wumpus ou zona segura inicial.
+    # Ouro não pode compartilhar célula com poço, wumpus, flecha ou zona segura inicial.
     used_w = set(wumpus_list)
-    cand_o = [p for p in todas if p not in pits and p not in used_w and p not in safe_start_zone]
+    cand_o = [
+        p for p in todas
+        if p not in pits and p not in used_w and p not in safe_start_zone and p != arrow_pos
+    ]
     random.shuffle(cand_o)
     gold_pos = set()
     for i in range(min(num_gold, len(cand_o))):
@@ -166,10 +191,10 @@ def criar_mundo(starts=None, num_wumpus=NUM_WUMPUS, num_gold=NUM_GOLD):
         celulas[r][c].add("O")
         gold_pos.add((r, c))
 
-    # Morcego não pode compartilhar célula com poço, ouro, wumpus ou zona segura inicial.
+    # Morcego não pode compartilhar célula com poço, ouro, wumpus, flecha ou zona segura inicial.
     cand_b = [
         p for p in todas
-        if p not in pits and p not in gold_pos and p not in used_w and p not in safe_start_zone
+        if p not in pits and p not in gold_pos and p not in used_w and p not in safe_start_zone and p != arrow_pos
     ]
     random.shuffle(cand_b)
     for i in range(min(NUM_BATS, len(cand_b))):
@@ -199,7 +224,8 @@ class Jogo:
         self.ouro      = 0
         self.collected_gold_positions = set()
         self.killed_wumpus_positions = set()
-        self.flecha    = True   # O agente começa com uma única flecha.
+        self.flecha       = False  # O agente começa sem flecha e precisa coletar a flecha no mapa.
+        self.flecha_usada = False  # True depois que a flecha for disparada.
         self.visitados = set()  # Células já visitadas (reveladas no mapa).
         self.perc_map  = {}     # Percepções salvas por célula visitada.
         self.msg       = ("", COL_TEXT)
@@ -286,7 +312,12 @@ class Jogo:
         if not self.vivo or self.saiu:
             return
         self._custo()
-        if "O" in self.celulas[self.r][self.c]:
+        if "A" in self.celulas[self.r][self.c]:
+            self.celulas[self.r][self.c].discard("A")
+            self.flecha = True
+            self.perc_map[(self.r, self.c)] = self._perceber(self.r, self.c)
+            self._msg("Flecha coletada! Agora voce pode abater um Wumpus.", COL_OK)
+        elif "O" in self.celulas[self.r][self.c]:
             self.celulas[self.r][self.c].discard("O")
             self.collected_gold_positions.add((self.r, self.c))
             self.ouro  += 1
@@ -306,6 +337,7 @@ class Jogo:
             return
         self._custo(extra=C_FLECHA)
         self.flecha = False
+        self.flecha_usada = True
         dr, dc = DIRS[self.dir]
         r, c   = self.r + dr, self.c + dc
         acertou = False
@@ -397,6 +429,7 @@ class JogoAjudante:
             starts=HELPER_STARTS,
             num_wumpus=HELPER_WUMPUS,
             num_gold=self.gold_target,
+            spawn_arrow=False,
         )
         self.wumpus_vivo = [True] * len(self.wumpuses)
         self.score = 0
@@ -536,6 +569,11 @@ class JogoAjudante:
             return None
         agent = self.agents[idx]
         self._custo(idx)
+        if "A" in self.celulas[agent["r"]][agent["c"]]:
+            self.celulas[agent["r"]][agent["c"]].discard("A")
+            agent["flecha"] = True
+            self.perc_map[(agent["r"], agent["c"])] = self._perceber(agent["r"], agent["c"])
+            return f"{agent['nome']} coletou a flecha!"
         if "O" in self.celulas[agent["r"]][agent["c"]]:
             self.celulas[agent["r"]][agent["c"]].discard("O")
             self.collected_gold_positions.add((agent["r"], agent["c"]))
@@ -1090,6 +1128,26 @@ class AutoPlayer:
             self.stuck_count = 0
             return
 
+        # Sem flecha, a maior prioridade é localizar e coletar a flecha do mapa.
+        if not self.jogo.flecha:
+            if "A" in self.jogo.celulas[r][c]:
+                self.queue.append("G")
+                self.stuck_count = 0
+                return
+            known_arrow = [(ar, ac) for (ar, ac) in visited if "A" in self.jogo.celulas[ar][ac]]
+            if known_arrow:
+                target = min(known_arrow, key=lambda p: abs(p[0] - r) + abs(p[1] - c))
+                path_to_arrow = self._path((r, c), target, visited | {target})
+                if path_to_arrow and len(path_to_arrow) > 1:
+                    self._enqueue_path(path_to_arrow)
+                    self.stuck_count = 0
+                    return
+
+        # Se houver posição certa de Wumpus, tenta usar a flecha estrategicamente.
+        if self._enqueue_shot_if_certain():
+            self.stuck_count = 0
+            return
+
         # Prioridade alta: se já conhece ouro não coletado, vai buscá-lo antes de explorar risco.
         known_gold = [(gr, gc) for (gr, gc) in visited if "O" in self.jogo.celulas[gr][gc]]
         if known_gold:
@@ -1099,11 +1157,6 @@ class AutoPlayer:
                 self._enqueue_path(path_to_gold)
                 self.stuck_count = 0
                 return
-
-        # Se houver posição certa de Wumpus, tenta usar a flecha estrategicamente.
-        if self._enqueue_shot_if_certain():
-            self.stuck_count = 0
-            return
 
         risk, _safe, bat_hint = self._risk_map()
 
@@ -1199,8 +1252,8 @@ class AutoPlayer:
         if not self.jogo.vivo or self.jogo.saiu:
             return None
 
-        # Interrompe qualquer plano para pegar ouro imediatamente ao entrar na célula.
-        if "O" in self.jogo.celulas[self.jogo.r][self.jogo.c]:
+        # Interrompe qualquer plano para pegar itens imediatamente ao entrar na célula.
+        if "A" in self.jogo.celulas[self.jogo.r][self.jogo.c] or "O" in self.jogo.celulas[self.jogo.r][self.jogo.c]:
             self.queue.clear()
             return "G"
 
@@ -1275,6 +1328,30 @@ def _draw_item(surf, key, img, cor, px, py, w, h):
                 (cx - w // 4, cy + h // 5),
             ]
             pygame.draw.polygon(surf, (20, 20, 20), points)
+        elif key == "A":
+            # Fallback visual para flecha de coleta quando a imagem nao esta disponivel.
+            cx = px + w // 2
+            cy = py + h // 2
+            shaft_left = px + max(4, w // 6)
+            shaft_right = px + w - max(8, w // 6)
+            pygame.draw.line(surf, COL_ARROW, (shaft_left, cy), (shaft_right, cy), max(2, w // 10))
+            head_w = max(8, w // 4)
+            head_h = max(8, h // 4)
+            pygame.draw.polygon(
+                surf,
+                COL_ARROW,
+                [(shaft_right, cy), (shaft_right - head_w, cy - head_h // 2), (shaft_right - head_w, cy + head_h // 2)],
+            )
+            feather_x = shaft_left + max(2, w // 10)
+            feather_h = max(3, h // 10)
+            for off in (-feather_h * 2, 0, feather_h * 2):
+                pygame.draw.line(
+                    surf,
+                    COL_ARROW,
+                    (feather_x, cy + off),
+                    (feather_x - max(6, w // 6), cy + off - (1 if off >= 0 else -1) * feather_h),
+                    max(1, w // 20),
+                )
         else:
             pygame.draw.rect(surf, cor, (px + 2, py + 2, w - 4, h - 4), border_radius=5)
             lbl = font_small.render(key, True, COL_TEXT)
@@ -1387,6 +1464,8 @@ def draw_cell(surf, jogo, r, c):
                 items.append(("W", img_wumpus, COL_WUMPUS))
         if "O" in jogo.celulas[r][c]:
             items.append(("O", img_gold,   COL_GOLD))
+        if "A" in jogo.celulas[r][c]:
+            items.append(("A", img_arrow,  COL_ARROW))
         if "B" in jogo.celulas[r][c]:
             items.append(("B", img_bat,    COL_BAT))
 
@@ -1493,8 +1572,7 @@ def draw_panel(surf, jogo):
             line(f"Base: [{TAM - agent['start'][0]},{agent['start'][1] + 1}]")
             line(f"Posicao: [{row_d},{col_d}]")
             line(f"Direcao: {DIR_ARROW[agent['dir']]} {DIR_NAMES[agent['dir']]}")
-            line(f"Flecha: {'SIM' if agent['flecha'] else 'NAO'}",
-                 COL_OK if agent["flecha"] else COL_WARN)
+
             if agent["vivo"]:
                 percs = jogo.perceber_atual(idx)
                 if percs:
@@ -1511,8 +1589,13 @@ def draw_panel(surf, jogo):
         state = "PAUSADO" if auto_pausado else "RODANDO"
         line(f"Estado: {state}", COL_WARN if auto_pausado else COL_OK)
     else:
-        flecha_str = "SIM" if jogo.flecha else "NAO"
-        line(f"Flecha: {flecha_str}", COL_OK if jogo.flecha else COL_WARN)
+        if jogo.flecha:
+            flecha_str, flecha_cor = "SIM", COL_OK
+        elif getattr(jogo, "flecha_usada", False):
+            flecha_str, flecha_cor = "USADO", (160, 160, 160)
+        else:
+            flecha_str, flecha_cor = "NAO", COL_WARN
+        line(f"Flecha: {flecha_str}", flecha_cor)
         row_d = TAM - jogo.r
         col_d = jogo.c + 1
         line(f"Posicao: [{row_d},{col_d}]")
